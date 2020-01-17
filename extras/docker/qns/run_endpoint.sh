@@ -21,7 +21,7 @@ check_testcase () {
     TESTNAME=$1
 
     case $1 in
-    handshake | resumption )
+    handshake | resumption | multiconnect )
         echo "supported"
         ;;
     transfer )
