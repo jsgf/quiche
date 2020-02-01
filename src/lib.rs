@@ -274,8 +274,14 @@ use std::str::FromStr;
 pub use crate::cc::Algorithm as CongestionControlAlgorithm;
 
 /// The current QUIC wire version.
-pub const PROTOCOL_VERSION: u32 = 0xff00_0018;
-const PROTOCOL_VERSION_OLD: u32 = 0xff00_0017;
+pub const PROTOCOL_VERSION: u32 = PROTOCOL_VERSION_DRAFT25;
+
+/// Supported QUIC versions.
+///
+/// Note that the older ones might not be fully supported.
+const PROTOCOL_VERSION_DRAFT25: u32 = 0xff00_0019;
+const PROTOCOL_VERSION_DRAFT24: u32 = 0xff00_0018;
+const PROTOCOL_VERSION_DRAFT23: u32 = 0xff00_0017;
 
 /// The maximum length of a connection ID.
 pub const MAX_CONN_ID_LEN: usize = crate::packet::MAX_CID_LEN as usize;
@@ -540,11 +546,11 @@ impl Config {
         self.tls_ctx.set_alpn(&self.application_protos)
     }
 
-    /// Sets the `idle_timeout` transport parameter.
+    /// Sets the `max_idle_timeout` transport parameter.
     ///
     /// The default value is infinite, that is, no timeout is used.
-    pub fn set_idle_timeout(&mut self, v: u64) {
-        self.local_transport_params.idle_timeout = v;
+    pub fn set_max_idle_timeout(&mut self, v: u64) {
+        self.local_transport_params.max_idle_timeout = v;
     }
 
     /// Sets the `max_packet_size transport` parameter.
@@ -796,6 +802,9 @@ pub struct Connection {
     /// Whether the connection handshake has completed.
     handshake_completed: bool,
 
+    /// Whether the HANDSHAKE_DONE has been sent.
+    handshake_done_sent: bool,
+
     /// Whether the connection handshake has been confirmed.
     handshake_confirmed: bool,
 
@@ -957,7 +966,13 @@ pub fn retry(
 
 /// Returns true if the given protocol version is supported.
 pub fn version_is_supported(version: u32) -> bool {
-    version == PROTOCOL_VERSION || version == PROTOCOL_VERSION_OLD
+    match version {
+        PROTOCOL_VERSION |
+        PROTOCOL_VERSION_DRAFT24 |
+        PROTOCOL_VERSION_DRAFT23 => true,
+
+        _ => false,
+    }
 }
 
 impl Connection {
@@ -1047,6 +1062,8 @@ impl Connection {
             verified_peer_address: odcid.is_some(),
 
             handshake_completed: false,
+
+            handshake_done_sent: false,
 
             handshake_confirmed: false,
 
@@ -1250,7 +1267,8 @@ impl Connection {
                 return Err(Error::Done);
             }
 
-            if hdr.odcid.as_ref() != Some(&self.dcid) {
+            // Check if Retry packet is valid.
+            if packet::verify_retry_integrity(&b, &self.dcid).is_err() {
                 return Err(Error::Done);
             }
 
@@ -1501,8 +1519,8 @@ impl Connection {
         self.pkt_num_spaces[epoch].largest_rx_pkt_num =
             cmp::max(self.pkt_num_spaces[epoch].largest_rx_pkt_num, pn);
 
-        if self.local_transport_params.idle_timeout > 0 {
-            self.idle_timer = Some(now + self.idle_timeout());
+        if let Some(idle_timeout) = self.idle_timeout() {
+            self.idle_timer = Some(now + idle_timeout);
         }
 
         self.recv_count += 1;
@@ -1658,6 +1676,10 @@ impl Connection {
                     self.pkt_num_spaces[epoch].ack_elicited = true;
                 },
 
+                frame::Frame::HandshakeDone => {
+                    self.handshake_done_sent = false;
+                },
+
                 _ => (),
             }
         }
@@ -1685,7 +1707,6 @@ impl Connection {
             scid: self.scid.clone(),
             pkt_num: 0,
             pkt_num_len: pn_len,
-            odcid: None,
             token: self.token.clone(),
             versions: None,
             key_phase: false,
@@ -1737,6 +1758,22 @@ impl Connection {
         }
 
         if pkt_type == packet::Type::Short && !is_closing {
+            // Create HANDSHAKE_DONE frame.
+            if self.handshake_completed &&
+                !self.handshake_done_sent &&
+                self.is_server &&
+                self.version >= PROTOCOL_VERSION_DRAFT25
+            {
+                let frame = frame::Frame::HandshakeDone;
+
+                payload_len += frame.wire_len();
+                left -= frame.wire_len();
+
+                frames.push(frame);
+
+                self.handshake_done_sent = true;
+            }
+
             // Create MAX_STREAMS_BIDI frame.
             if self.streams.should_update_max_streams_bidi() {
                 let max = self.streams.update_max_streams_bidi();
@@ -2087,11 +2124,10 @@ impl Connection {
 
         // (Re)start the idle timer if we are sending the first ack-eliciting
         // packet since last receiving a packet.
-        if ack_eliciting &&
-            !self.ack_eliciting_sent &&
-            self.local_transport_params.idle_timeout > 0
-        {
-            self.idle_timer = Some(now + self.idle_timeout());
+        if ack_eliciting && !self.ack_eliciting_sent {
+            if let Some(idle_timeout) = self.idle_timeout() {
+                self.idle_timer = Some(now + idle_timeout);
+            }
         }
 
         if ack_eliciting {
@@ -2549,6 +2585,11 @@ impl Connection {
         self.handshake.alpn_protocol()
     }
 
+    /// Returns the peer's leaf certificate (if any) as a DER-encoded buffer.
+    pub fn peer_cert(&self) -> Option<Vec<u8>> {
+        self.handshake.peer_cert()
+    }
+
     /// Returns true if the connection handshake is complete.
     pub fn is_established(&self) -> bool {
         self.handshake_completed
@@ -2902,6 +2943,21 @@ impl Connection {
             frame::Frame::ApplicationClose { .. } => {
                 self.draining_timer = Some(now + (self.recovery.pto() * 3));
             },
+
+            frame::Frame::HandshakeDone => {
+                if self.version < PROTOCOL_VERSION_DRAFT25 {
+                    return Err(Error::InvalidFrame);
+                }
+
+                if self.is_server {
+                    return Err(Error::InvalidPacket);
+                }
+
+                self.handshake_confirmed = true;
+
+                // Once the handshake is confirmed, we can drop Handshake keys.
+                self.drop_epoch_state(packet::EPOCH_HANDSHAKE);
+            },
         }
 
         Ok(())
@@ -2931,11 +2987,35 @@ impl Connection {
     }
 
     /// Returns the idle timeout value.
-    fn idle_timeout(&mut self) -> time::Duration {
-        cmp::max(
-            time::Duration::from_millis(self.local_transport_params.idle_timeout),
-            3 * self.recovery.pto(),
-        )
+    ///
+    /// `None` is returned if both end-points disabled the idle timeout.
+    fn idle_timeout(&mut self) -> Option<time::Duration> {
+        // If the transport parameter is set to 0, then the respective endpoint
+        // decided to disable the idle timeout. If both are disabled we should
+        // not set any timeout.
+        if self.local_transport_params.max_idle_timeout == 0 &&
+            self.peer_transport_params.max_idle_timeout == 0
+        {
+            return None;
+        }
+
+        // If the local endpoint or the peer disabled the idle timeout, use the
+        // other peer's value, otherwise use the minimum of the two values.
+        let idle_timeout = if self.local_transport_params.max_idle_timeout == 0 {
+            self.peer_transport_params.max_idle_timeout
+        } else if self.peer_transport_params.max_idle_timeout == 0 {
+            self.local_transport_params.max_idle_timeout
+        } else {
+            cmp::min(
+                self.local_transport_params.max_idle_timeout,
+                self.peer_transport_params.max_idle_timeout,
+            )
+        };
+
+        let idle_timeout = time::Duration::from_millis(idle_timeout);
+        let idle_timeout = cmp::max(idle_timeout, 3 * self.recovery.pto());
+
+        Some(idle_timeout)
     }
 }
 
@@ -2975,7 +3055,7 @@ impl std::fmt::Debug for Stats {
 #[derive(Clone, PartialEq)]
 struct TransportParams {
     pub original_connection_id: Option<Vec<u8>>,
-    pub idle_timeout: u64,
+    pub max_idle_timeout: u64,
     pub stateless_reset_token: Option<Vec<u8>>,
     pub max_packet_size: u64,
     pub initial_max_data: u64,
@@ -2995,7 +3075,7 @@ impl Default for TransportParams {
     fn default() -> TransportParams {
         TransportParams {
             original_connection_id: None,
-            idle_timeout: 0,
+            max_idle_timeout: 0,
             stateless_reset_token: None,
             max_packet_size: 65527,
             initial_max_data: 0,
@@ -3037,7 +3117,7 @@ impl TransportParams {
                 },
 
                 0x0001 => {
-                    tp.idle_timeout = val.get_varint()?;
+                    tp.max_idle_timeout = val.get_varint()?;
                 },
 
                 0x0002 => {
@@ -3152,10 +3232,10 @@ impl TransportParams {
                 }
             };
 
-            if tp.idle_timeout != 0 {
+            if tp.max_idle_timeout != 0 {
                 b.put_u16(0x0001)?;
-                b.put_u16(octets::varint_len(tp.idle_timeout) as u16)?;
-                b.put_varint(tp.idle_timeout)?;
+                b.put_u16(octets::varint_len(tp.max_idle_timeout) as u16)?;
+                b.put_varint(tp.max_idle_timeout)?;
             }
 
             if let Some(ref token) = tp.stateless_reset_token {
@@ -3257,7 +3337,7 @@ impl TransportParams {
 
 impl std::fmt::Debug for TransportParams {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "idle_timeout={} ", self.idle_timeout)?;
+        write!(f, "max_idle_timeout={} ", self.max_idle_timeout)?;
         write!(f, "max_packet_size={} ", self.max_packet_size)?;
         write!(f, "initial_max_data={} ", self.initial_max_data)?;
         write!(
@@ -3515,7 +3595,6 @@ pub mod testing {
             scid: conn.scid.clone(),
             pkt_num: 0,
             pkt_num_len: pn_len,
-            odcid: None,
             token: conn.token.clone(),
             versions: None,
             key_phase: false,
@@ -3602,7 +3681,7 @@ mod tests {
     fn transport_params() {
         let tp = TransportParams {
             original_connection_id: None,
-            idle_timeout: 30,
+            max_idle_timeout: 30,
             stateless_reset_token: Some(vec![0xba; 16]),
             max_packet_size: 23_421,
             initial_max_data: 424_645_563,
@@ -3702,7 +3781,7 @@ mod tests {
         assert!(!pipe.server.handshake_completed);
         assert!(!pipe.server.handshake_confirmed);
 
-        // Server completes handshake.
+        // Server completes handshake and sends HANDSHAKE_DONE.
         len = testing::recv_send(&mut pipe.server, &mut buf, len).unwrap();
 
         assert!(pipe.client.handshake_completed);
@@ -3711,40 +3790,17 @@ mod tests {
         assert!(pipe.server.handshake_completed);
         assert!(!pipe.server.handshake_confirmed);
 
-        // Client acks 1-RTT packet.
+        // Client acks 1-RTT packet, and confirms handshake.
         len = testing::recv_send(&mut pipe.client, &mut buf, len).unwrap();
 
         assert!(pipe.client.handshake_completed);
-        assert!(!pipe.client.handshake_confirmed);
+        assert!(pipe.client.handshake_confirmed);
 
         assert!(pipe.server.handshake_completed);
         assert!(!pipe.server.handshake_confirmed);
 
         // Server handshake is confirmed.
-        len = testing::recv_send(&mut pipe.server, &mut buf, len).unwrap();
-
-        assert!(pipe.client.handshake_completed);
-        assert!(!pipe.client.handshake_confirmed);
-
-        assert!(pipe.server.handshake_completed);
-        assert!(pipe.server.handshake_confirmed);
-
-        // Client sends 1-RTT ack-eliciting packet.
-        assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
-
-        len = testing::recv_send(&mut pipe.client, &mut buf, len).unwrap();
-
-        // Server acks 1-RTT packet.
-        len = testing::recv_send(&mut pipe.server, &mut buf, len).unwrap();
-
-        assert!(pipe.client.handshake_completed);
-        assert!(!pipe.client.handshake_confirmed);
-
-        assert!(pipe.server.handshake_completed);
-        assert!(pipe.server.handshake_confirmed);
-
-        // Client handshake is confirmed.
-        testing::recv_send(&mut pipe.client, &mut buf, len).unwrap();
+        testing::recv_send(&mut pipe.server, &mut buf, len).unwrap();
 
         assert!(pipe.client.handshake_completed);
         assert!(pipe.client.handshake_confirmed);
@@ -4928,6 +4984,63 @@ mod tests {
             pipe.client.stream_send(0, b"", true),
             Err(Error::InvalidStreamState)
         );
+    }
+
+    #[test]
+    fn config_set_cc_algorithm_name() {
+        let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+
+        assert_eq!(config.set_cc_algorithm_name("reno"), Ok(()));
+
+        // Unknown name.
+        assert_eq!(
+            config.set_cc_algorithm_name("???"),
+            Err(Error::CongestionControl)
+        );
+    }
+
+    #[test]
+    fn peer_cert() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = testing::Pipe::default().unwrap();
+
+        assert_eq!(pipe.handshake(&mut buf), Ok(()));
+
+        match pipe.client.peer_cert() {
+            Some(c) => assert_eq!(c.len(), 919),
+
+            None => panic!("missing server certificate"),
+        }
+    }
+
+    #[test]
+    fn retry() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = testing::Pipe::default().unwrap();
+
+        // Client sends initial flight.
+        let mut len = pipe.client.send(&mut buf).unwrap();
+
+        // Server sends Retry packet.
+        let hdr = Header::from_slice(&mut buf[..len], MAX_CONN_ID_LEN).unwrap();
+
+        let mut scid = [0; MAX_CONN_ID_LEN];
+        rand::rand_bytes(&mut scid[..]);
+
+        let token = b"quiche test retry token";
+
+        len =
+            packet::retry(&hdr.scid, &hdr.dcid, &scid, token, &mut buf).unwrap();
+
+        // Client receives Retry and sends new Initial.
+        assert_eq!(pipe.client.recv(&mut buf[..len]), Err(Error::Done));
+
+        len = pipe.client.send(&mut buf).unwrap();
+
+        let hdr = Header::from_slice(&mut buf[..len], MAX_CONN_ID_LEN).unwrap();
+        assert_eq!(&hdr.token.unwrap(), token);
     }
 }
 

@@ -66,7 +66,7 @@ impl cc::CongestionControl for Reno {
     }
 
     fn collapse_cwnd(&mut self) {
-        self.congestion_window = cc::INITIAL_WINDOW;
+        self.congestion_window = cc::MINIMUM_WINDOW;
     }
 
     fn bytes_in_flight(&self) -> usize {
@@ -88,7 +88,7 @@ impl cc::CongestionControl for Reno {
 
     fn on_packet_acked_cc(
         &mut self, packet: &Sent, _srtt: Duration, _min_rtt: Duration,
-        _trace_id: &str,
+        app_limited: bool, _trace_id: &str,
     ) {
         self.bytes_in_flight -= packet.size;
 
@@ -96,7 +96,7 @@ impl cc::CongestionControl for Reno {
             return;
         }
 
-        if self.is_app_limited() {
+        if app_limited {
             return;
         }
 
@@ -195,6 +195,7 @@ mod tests {
             &p,
             Duration::new(0, 1),
             Duration::new(0, 1),
+            false,
             TRACE_ID,
         );
 
@@ -254,11 +255,23 @@ mod tests {
             &p,
             Duration::new(0, 1),
             Duration::new(0, 1),
+            false,
             TRACE_ID,
         );
 
         // Check if cwnd increase is smaller than a packet size (congestion
         // avoidance).
         assert!(cc.cwnd() < prev_cwnd + 1111);
+    }
+
+    #[test]
+    fn reno_collapse_cwnd() {
+        init();
+
+        let mut cc = cc::new_congestion_control(cc::Algorithm::Reno);
+
+        // cwnd will be reset
+        cc.collapse_cwnd();
+        assert_eq!(cc.cwnd(), cc::MINIMUM_WINDOW);
     }
 }

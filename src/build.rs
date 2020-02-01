@@ -1,41 +1,31 @@
 // Additional parameters for Android build of BoringSSL.
-const CMAKE_PARAMS_ANDROID: &[(&str, &[(&str, &str)])] = &[
-    ("aarch64", &[
-        ("ANDROID_TOOLCHAIN_NAME", "aarch64-linux-android-4.9"),
-        ("ANDROID_NATIVE_API_LEVEL", "21"),
-        (
-            "CMAKE_TOOLCHAIN_FILE",
-            "${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
-        ),
-        ("ANDROID_STL", "c++_shared"),
-    ]),
-    ("arm", &[
-        ("ANDROID_TOOLCHAIN_NAME", "arm-linux-androideabi-4.9"),
-        ("ANDROID_NATIVE_API_LEVEL", "21"),
-        (
-            "CMAKE_TOOLCHAIN_FILE",
-            "${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
-        ),
-        ("ANDROID_STL", "c++_shared"),
-    ]),
-    ("x86", &[
-        ("ANDROID_TOOLCHAIN_NAME", "x86-linux-android-4.9"),
-        ("ANDROID_NATIVE_API_LEVEL", "21"),
-        (
-            "CMAKE_TOOLCHAIN_FILE",
-            "${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
-        ),
-        ("ANDROID_STL", "c++_shared"),
-    ]),
-    ("x86_64", &[
-        ("ANDROID_TOOLCHAIN_NAME", "x86_64-linux-android-4.9"),
-        ("ANDROID_NATIVE_API_LEVEL", "21"),
-        (
-            "CMAKE_TOOLCHAIN_FILE",
-            "${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
-        ),
-        ("ANDROID_STL", "c++_shared"),
-    ]),
+//
+// Android NDK < 18 with GCC.
+const CMAKE_PARAMS_ANDROID_NDK_OLD_GCC: &[(&str, &[(&str, &str)])] = &[
+    ("aarch64", &[(
+        "ANDROID_TOOLCHAIN_NAME",
+        "aarch64-linux-android-4.9",
+    )]),
+    ("arm", &[(
+        "ANDROID_TOOLCHAIN_NAME",
+        "arm-linux-androideabi-4.9",
+    )]),
+    ("x86", &[(
+        "ANDROID_TOOLCHAIN_NAME",
+        "x86-linux-android-4.9",
+    )]),
+    ("x86_64", &[(
+        "ANDROID_TOOLCHAIN_NAME",
+        "x86_64-linux-android-4.9",
+    )]),
+];
+
+// Android NDK >= 19.
+const CMAKE_PARAMS_ANDROID_NDK: &[(&str, &[(&str, &str)])] = &[
+    ("aarch64", &[("ANDROID_ABI", "arm64-v8a")]),
+    ("arm", &[("ANDROID_ABI", "armeabi-v7a")]),
+    ("x86", &[("ANDROID_ABI", "x86")]),
+    ("x86_64", &[("ANDROID_ABI", "x86_64")]),
 ];
 
 const CMAKE_PARAMS_IOS: &[(&str, &[(&str, &str)])] = &[
@@ -65,13 +55,13 @@ const CMAKE_PARAMS_IOS: &[(&str, &[(&str, &str)])] = &[
 fn get_boringssl_platform_output_path(lib: &str) -> String {
     if cfg!(windows) {
         if cfg!(debug_assertions) {
-            return format!("{}/Debug", lib);
+            format!("{}/Debug", lib)
         } else {
-            return format!("{}/RelWithDebInfo", lib);
+            format!("{}/RelWithDebInfo", lib)
         }
     } else {
-        return format!("{}", lib);
-    };
+        lib.to_string()
+    }
 }
 
 /// Returns a new cmake::Config for building BoringSSL.
@@ -85,21 +75,35 @@ fn get_boringssl_cmake_config() -> cmake::Config {
     let mut boringssl_cmake = cmake::Config::new("deps/boringssl");
 
     // Add platform-specific parameters.
-    return match os.as_ref() {
+    match os.as_ref() {
         "android" => {
+            let cmake_params_android = if cfg!(feature = "ndk-old-gcc") {
+                CMAKE_PARAMS_ANDROID_NDK_OLD_GCC
+            } else {
+                CMAKE_PARAMS_ANDROID_NDK
+            };
+
             // We need ANDROID_NDK_HOME to be set properly.
             let android_ndk_home = std::env::var("ANDROID_NDK_HOME")
                 .expect("Please set ANDROID_NDK_HOME for Android build");
-            for (android_arch, params) in CMAKE_PARAMS_ANDROID {
+            let android_ndk_home = std::path::Path::new(&android_ndk_home);
+            for (android_arch, params) in cmake_params_android {
                 if *android_arch == arch {
                     for (name, value) in *params {
-                        let value = value
-                            .replace("${ANDROID_NDK_HOME}", &android_ndk_home);
                         eprintln!("android arch={} add {}={}", arch, name, value);
                         boringssl_cmake.define(name, value);
                     }
                 }
             }
+            let toolchain_file =
+                android_ndk_home.join("build/cmake/android.toolchain.cmake");
+            let toolchain_file = toolchain_file.to_str().unwrap();
+            eprintln!("android toolchain={}", toolchain_file);
+            boringssl_cmake.define("CMAKE_TOOLCHAIN_FILE", toolchain_file);
+
+            // 21 is the minimum level tested. You can give higher value.
+            boringssl_cmake.define("ANDROID_NATIVE_API_LEVEL", "21");
+            boringssl_cmake.define("ANDROID_STL", "c++_shared");
 
             boringssl_cmake
         },
@@ -133,7 +137,7 @@ fn get_boringssl_cmake_config() -> cmake::Config {
 
             boringssl_cmake
         },
-    };
+    }
 }
 
 fn write_pkg_config() {
